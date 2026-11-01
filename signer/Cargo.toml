@@ -1,0 +1,22 @@
+[package]
+name = "kalzit-catalog-signer"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/MouseWerk/kalzit-plugins"
+description = "Signs the catalog index with the catalog key; the only code built next to that key"
+publish = false
+
+# Kept small on purpose, like kalzit-release in MouseWerk/Kalzit: the publish workflow builds this
+# crate in the job that holds the catalog key, so it must not pull in anything else.
+[dependencies]
+base64 = "0.23.1"
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std", "zeroize"] }
+sha2 = "0.11.1"
+zeroize = "1.9.1"
+
+[[bin]]
+name = "kalzit-catalog-signer"
+path = "src/main.rs"
+
+[workspace]

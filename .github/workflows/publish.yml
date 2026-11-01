@@ -1,0 +1,205 @@
+name: Publish
+
+# Builds the catalog index from main, signs it with the catalog key and publishes it on GitHub
+# Pages at https://mousewerk.github.io/kalzit-plugins/catalog.json, with catalog.json.sig next to
+# it (the address Kalzit reads, setting plugins.catalog_url), the store data for the website
+# (store.json), the screenshots and the publisher keys.
+#
+# Runs on main only: after a merge, and twice a month so the index never expires (Kalzit takes an
+# index for at most 31 days; this one is valid for 30). Every run waits for the owner's approval
+# in the `catalog-signing` environment.
+#
+# Hardening, because the signing job holds the catalog key:
+# - every action is pinned to a full commit SHA (the comment names the version it was);
+# - checkouts keep no credentials, the token reads only, except the Pages deployment;
+# - only main is published;
+# - the catalog key lives only in the `catalog-signing` environment (required reviewer: the
+#   owner, branch main only). The job that uses it downloads the index the key-free build job
+#   made, checks its hash, builds only the small signer crate (signer/, ed25519-dalek and three
+#   small crates) and signs the index's exact bytes. Nothing else runs next to the key.
+# - Before the site goes out, the signature is checked with Kalzit's own catalog parser.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 1,15 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  SITE_URL: https://mousewerk.github.io/kalzit-plugins
+
+jobs:
+  # Checks the registry with every package and builds the site, unsigned. No secret here.
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      sums: ${{ steps.sums.outputs.sums }}
+      tool: ${{ steps.sums.outputs.tool }}
+    steps:
+      - name: Main only
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::only main is published"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Catalog key
+        run: |
+          if [ ! -f keys/catalog.pub ]; then
+            echo "::error::keys/catalog.pub is missing: the owner sets up the catalog key first (CONTRIBUTING.md, \"Catalog key\")"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10
+        with:
+          toolchain: stable
+      - run: cargo build --release --locked --manifest-path tools/registry/Cargo.toml
+      - name: Download the packages
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/packages"
+          tools/registry/target/release/kalzit-registry fetch-list --all > "$RUNNER_TEMP/packages.txt"
+          while read -r sha size url; do
+            echo "$url"
+            curl -fsSL --proto '=https' --proto-redir '=https' --max-redirs 5 --max-time 600 \
+              --max-filesize "$size" -o "$RUNNER_TEMP/packages/$sha" "$url"
+          done < "$RUNNER_TEMP/packages.txt"
+      - name: Check and build
+        run: |
+          set -euo pipefail
+          tools/registry/target/release/kalzit-registry build --packages "$RUNNER_TEMP/packages" \
+            --out site --site-url "$SITE_URL"
+          mkdir tool
+          cp tools/registry/target/release/kalzit-registry tool/
+      - name: Hashes
+        id: sums
+        run: |
+          set -euo pipefail
+          {
+            echo "sums<<SUMS"
+            (cd site && find . -type f | sort | xargs sha256sum)
+            echo "SUMS"
+            echo "tool=$(sha256sum tool/kalzit-registry | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: site-unsigned
+          path: site/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: registry-tool
+          path: tool/
+          if-no-files-found: error
+
+  # Signs the index with KALZIT_CATALOG_SIGNING_KEY from the `catalog-signing` environment.
+  sign:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: catalog-signing
+    outputs:
+      signature: ${{ steps.sign.outputs.signature }}
+    steps:
+      - name: Main only
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::only main is signed"
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: site-unsigned
+          path: site
+      - name: Check the download
+        env:
+          SUMS: ${{ needs.build.outputs.sums }}
+        run: |
+          set -euo pipefail
+          cd site
+          printf '%s\n' "$SUMS" | sha256sum -c -
+          test "$(find . -type f | wc -l)" -eq "$(printf '%s\n' "$SUMS" | grep -c .)"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10
+        with:
+          toolchain: stable
+      # Only the small signer crate is built next to the key.
+      - run: cargo build --release --locked --manifest-path signer/Cargo.toml
+      - name: Sign
+        id: sign
+        env:
+          KALZIT_CATALOG_SIGNING_KEY: ${{ secrets.KALZIT_CATALOG_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KALZIT_CATALOG_SIGNING_KEY" ]; then
+            echo "::error::KALZIT_CATALOG_SIGNING_KEY is not set in the catalog-signing environment (CONTRIBUTING.md, \"Catalog key\")"
+            exit 1
+          fi
+          mkdir signature
+          signer/target/release/kalzit-catalog-signer site/catalog.json keys/catalog.pub signature/catalog.json.sig
+          echo "signature=$(sha256sum signature/catalog.json.sig | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: catalog-signature
+          path: signature/
+          if-no-files-found: error
+
+  # Checks the signed index as Kalzit does and deploys the site to GitHub Pages.
+  deploy:
+    needs: [build, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: site-unsigned
+          path: site
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: catalog-signature
+          path: site
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: registry-tool
+          path: tool
+      - name: Check the downloads and the signature
+        env:
+          SUMS: ${{ needs.build.outputs.sums }}
+          TOOL: ${{ needs.build.outputs.tool }}
+          SIGNATURE: ${{ needs.sign.outputs.signature }}
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' "$TOOL" tool/kalzit-registry | sha256sum -c -
+          printf '%s  %s\n' "$SIGNATURE" site/catalog.json.sig | sha256sum -c -
+          (cd site && printf '%s\n' "$SUMS" | sha256sum -c -)
+          test "$(find site -type f | wc -l)" -eq "$(( $(printf '%s\n' "$SUMS" | grep -c .) + 1 ))"
+          chmod +x tool/kalzit-registry
+          tool/kalzit-registry verify-catalog --index site/catalog.json \
+            --signature site/catalog.json.sig --public-key-file keys/catalog.pub
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site/
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

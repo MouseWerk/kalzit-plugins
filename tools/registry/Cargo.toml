@@ -1,0 +1,26 @@
+[package]
+name = "kalzit-registry"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/MouseWerk/kalzit-plugins"
+description = "Checks the plugin registry and builds the catalog index and the store data from it"
+publish = false
+
+# The registry reads packages and builds the index with Kalzit's own plugin crates, pinned to one
+# commit of MouseWerk/Kalzit, so the checks here are exactly the ones Kalzit makes. This tool never
+# holds the catalog key; the signer (../../signer) is a crate of its own.
+[dependencies]
+base64 = "0.23.1"
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["std"] }
+hex = "0.4.3"
+imagesize = "0.15.0"
+kalzit-plugin-api = { git = "https://github.com/MouseWerk/Kalzit", rev = "0352da509e7736501c77cad028d141dbade944a6" }
+kalzit-plugin-tool = { git = "https://github.com/MouseWerk/Kalzit", rev = "0352da509e7736501c77cad028d141dbade944a6" }
+semver = "1.0.28"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+toml = "1.1.8"
+
+[workspace]
