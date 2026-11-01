@@ -1,0 +1,126 @@
+name: CI
+
+# Checks every pull request and every push to main. Read-only: the workflow token can only read,
+# and no secret is used, so a pull request from a fork runs with nothing to steal. Packages are
+# downloaded and read as zip files only; no plugin code runs.
+#
+# - `registry`: the registry files, the rules against main (versions only increase, nothing
+#   published changes; changes that need the owner's eye are annotated), every package that is
+#   new against the published catalog and not revoked (SHA-256, size, signature with its publisher
+#   key, permissions), and a preview of the catalog index and store data as an artifact (unsigned).
+# - `tools`: format, lints and tests of the registry tool and the signer on Linux and Windows.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  registry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10
+        with:
+          toolchain: stable
+      - run: cargo build --release --locked --manifest-path tools/registry/Cargo.toml
+      # What main looked like before this change: the base of the pull request, or the commit
+      # before a push.
+      - name: Base
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ -n "$BASE_REF" ]; then
+            base="$(git rev-parse "origin/$BASE_REF")"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            base="$BEFORE"
+          else
+            base="$(git rev-parse HEAD^)"
+          fi
+          git worktree add --detach "$RUNNER_TEMP/base" "$base"
+      # The catalog as published last: versions it lists unchanged were checked when they were
+      # published and are not downloaded again (CONTRIBUTING.md, "What CI checks").
+      - name: Published catalog
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/previous"
+          for f in catalog.json catalog.json.sig store.json; do
+            curl -fsSL --proto '=https' --max-redirs 0 --max-time 60 --max-filesize 4194304 \
+              -o "$RUNNER_TEMP/previous/$f" "https://mousewerk.github.io/kalzit-plugins/$f" \
+              || rm -f "$RUNNER_TEMP/previous/$f"
+          done
+          ls -l "$RUNNER_TEMP/previous"
+      - name: Download the packages
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/packages"
+          tools/registry/target/release/kalzit-registry fetch-list --previous "$RUNNER_TEMP/previous" \
+            > "$RUNNER_TEMP/packages.txt"
+          while read -r sha size url; do
+            echo "$url"
+            curl -fsSL --proto '=https' --proto-redir '=https' --max-redirs 5 --max-time 600 \
+              --max-filesize "$size" -o "$RUNNER_TEMP/packages/$sha" "$url"
+          done < "$RUNNER_TEMP/packages.txt"
+      - name: Check
+        run: |
+          tools/registry/target/release/kalzit-registry check --base "$RUNNER_TEMP/base" \
+            --previous "$RUNNER_TEMP/previous" --packages "$RUNNER_TEMP/packages"
+      - name: Preview of the catalog
+        run: |
+          tools/registry/target/release/kalzit-registry build --packages "$RUNNER_TEMP/packages" \
+            --previous "$RUNNER_TEMP/previous" --out "$RUNNER_TEMP/site" \
+            --site-url "https://mousewerk.github.io/kalzit-plugins"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: catalog-preview
+          path: ${{ runner.temp }}/site/
+          if-no-files-found: error
+          retention-days: 14
+
+  tools:
+    name: tools (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Registry tool
+        shell: bash
+        working-directory: tools/registry
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets
+          cargo test --locked
+      - name: Signer
+        shell: bash
+        working-directory: signer
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets
+          cargo test --locked

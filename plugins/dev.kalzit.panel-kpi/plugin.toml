@@ -1,0 +1,27 @@
+id = "dev.kalzit.panel-kpi"
+name = "KPI tile"
+kind = "panel"
+category = "visualization"
+publisher = "kalzit"
+author = "Kalzit"
+source = "https://github.com/MouseWerk/Kalzit"
+license = "AGPL-3.0-only"
+homepage = "https://github.com/MouseWerk/Kalzit/tree/main/examples/plugins/panel-kpi"
+
+[description]
+en = "The latest value of a number field, its change and a sparkline."
+de = "Der neueste Wert eines Zahlenfelds, seine Änderung und eine Verlaufslinie."
+
+
+[[screenshots]]
+file = "screenshots/dashboard-dark.webp"
+alt = { en = "A dashboard with four KPI tiles, each with the latest value, its change and a sparkline.", de = "Ein Dashboard mit vier KPI-Kacheln, jede mit dem neuesten Wert, seiner Änderung und einer Verlaufslinie." }
+
+[[versions]]
+version = "0.1.0"
+released = "2026-11-01"
+url = "https://github.com/MouseWerk/Kalzit/releases/download/v0.5.0/dev.kalzit.panel-kpi-0.1.0.zip"
+sha256 = "24cad8b9ca93a59e67c2d2cc44bdb73ea34548127d98c2312fa854a802494204"
+size = 4928
+key_id = "581c30a0d8384cfd"
+network = []

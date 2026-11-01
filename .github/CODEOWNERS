@@ -1,0 +1,9 @@
+# Changes to the workflows, the tools, the signer, the catalog key, the publishers and the
+# revocations need the owner's review. Code owner reviews are not required (single maintainer);
+# the Review workflow flags these paths on every pull request instead (CONTRIBUTING.md).
+/.github/ @mauricekleindienst
+/signer/ @mauricekleindienst
+/tools/ @mauricekleindienst
+/keys/ @mauricekleindienst
+/publishers/ @mauricekleindienst
+/revocations.toml @mauricekleindienst

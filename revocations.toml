@@ -1,0 +1,7 @@
+# Withdrawn plugin versions. Every entry goes into the signed catalog: Kalzit refuses to install
+# these versions from the catalog and shows the revocation on installed plugins it matches.
+#
+# [[revoked]]
+# id = "dev.example.redis"
+# versions = "<1.2.1"      # a semver requirement: "*", "<1.2.1", "=1.0.0"
+# reason = "CVE-2026-0001: ..."   # at most 280 characters, one line
