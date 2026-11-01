@@ -19,10 +19,12 @@ appended.
 
 | Path | |
 |---|---|
-| `plugins/<id>/plugin.toml` | One plugin: texts, category, permissions, screenshots and its versions with release URL, SHA-256, size and key id. |
+| `plugins/<id>/plugin.toml` | One plugin: texts, category, screenshots and its versions with release URL, SHA-256, size, key id and network targets. |
 | `publishers/<name>.pub` | A publisher's Ed25519 public key, base64. |
+| `publishers/<name>.toml` | The names that publisher's plugins may show as author. |
 | `revocations.toml` | Withdrawn versions. |
 | `keys/catalog.pub` | The public key of the catalog signing key. |
+| `keys/rotations.toml` | Every change of the catalog key (only once one happens). |
 | `tools/registry` | `kalzit-registry`: the checks and the catalog build, with Kalzit's own plugin crates. |
 | `signer` | `kalzit-catalog-signer`: the only code built next to the catalog key. |
 | `.github/workflows/ci.yml` | Checks for every pull request, read-only and without secrets. |

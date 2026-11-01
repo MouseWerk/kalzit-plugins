@@ -1,0 +1,5 @@
+# Changes to the workflows, the tools, the signer and the catalog key need the owner's review.
+/.github/ @mauricekleindienst
+/signer/ @mauricekleindienst
+/tools/ @mauricekleindienst
+/keys/ @mauricekleindienst

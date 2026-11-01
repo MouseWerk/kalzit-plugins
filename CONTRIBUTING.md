@@ -33,6 +33,13 @@ How a plugin gets in:
 plugins/<id>/plugin.toml            the manifest below
 plugins/<id>/screenshots/<file>     optional, up to 8 png, webp or jpg files of at most 1 MiB
 publishers/<name>.pub               your public key, once: one line, base64 (44 characters)
+publishers/<name>.toml              once: the names your plugins may show as author
+```
+
+`publishers/<name>.toml`:
+
+```toml
+authors = ["Your Name"]
 ```
 
 `plugins/<id>/plugin.toml`:
@@ -43,21 +50,14 @@ name = "Redis"                       # equals the package's name, at most 64 cha
 kind = "datasource"                  # datasource or panel, as in the package
 category = "databases"               # databases, metrics-and-logs, files-and-apis, visualization, utilities
 publisher = "yourname"               # publishers/yourname.pub
-author = "Your Name"                 # shown as the publisher, at most 64 characters
-source = "https://github.com/yourname/kalzit-redis"
+author = "Your Name"                 # shown as the publisher; one of the authors in publishers/yourname.toml
+source = "https://github.com/yourname/kalzit-redis"   # the repository the release assets belong to
 license = "MIT"
 homepage = "https://github.com/yourname/kalzit-redis#readme"   # optional
 
 [description]                        # one line each, at most 280 characters
 en = "Keys and streams of Redis as frames."
 de = "Schlüssel und Streams aus Redis als Tabellen."             # optional
-
-[permissions]
-# The network targets the package declares, in the words Kalzit's catalog uses: "host:port" for a
-# fixed host, "*:port" for a host from the settings with a default port, "*" for any other target
-# from the settings. Exactly the package's targets, lowercase. Panels have none: they run in a
-# sandboxed frame without network access.
-network = ["*:6379"]
 
 [[screenshots]]                      # optional
 file = "screenshots/query.webp"
@@ -66,10 +66,16 @@ alt = { en = "A query of a Redis stream in Explore.", de = "Eine Abfrage eines R
 [[versions]]                         # oldest first; add new versions at the end
 version = "1.0.0"                    # equals the package's version
 released = "2026-11-01"
+# A release asset of `source`: the address starts with <source>/releases/download/.
 url = "https://github.com/yourname/kalzit-redis/releases/download/v1.0.0/io.github.yourname.redis-1.0.0.zip"
 sha256 = "<64 lowercase hex digits of the package file>"
 size = 1840000                       # the package file's size in bytes
 key_id = "<16 hex digits>"           # the key id of your publisher key, as kalzit-plugin keygen prints it
+# The network targets this version declares, in the words Kalzit's catalog uses: "host:port" for a
+# fixed host, "*:port" for a host from the settings with a default port, "*" for any other target
+# from the settings. Exactly the package's targets, lowercase; a new version may change them.
+# Panels have none: they run in a sandboxed frame without network access.
+network = ["*:6379"]
 ```
 
 Compute the hash and size of the package file with `sha256sum` and `stat -c %s` (or
@@ -77,24 +83,36 @@ Compute the hash and size of the package file with `sha256sum` and `stat -c %s` 
 
 ## What CI checks
 
-- The manifest's schema and texts, the category, unique ids, and that nothing in the plugin's
-  directory is unlisted.
-- Every version: the package downloaded from `url` has exactly `size` bytes and `sha256`, is a
+- The manifest's schema and texts, the category, unique ids, that the author belongs to the
+  publisher, that every `url` is a release asset of `source`, and that nothing in the plugin's
+  directory is unlisted or a link.
+- Every version that is new: the package downloaded from `url` has exactly `size` bytes and `sha256`, is a
   valid Kalzit package (paths, files and hashes as Kalzit checks them), is signed with your
   publisher key, and its id, version, kind and name match the entry. The listed network targets
   must equal the package's targets, and fixed hosts must not be private or loopback addresses,
   which Kalzit refuses. A panel bundle must be one Kalzit can serve.
 - Against main: published versions never change and new versions are higher than all published
   ones; a published key, publisher, kind or revocation never changes, and a published plugin is
-  not removed.
+  not removed. Changes of the name, author, source or homepage of a published plugin, new
+  publishers and changed author lists are allowed but marked in the CI run for the owner.
 - The catalog built from the registry is one Kalzit takes. A preview of it is attached to the CI
   run as the artifact `catalog-preview` (unsigned).
+
+Packages are checked once. A version is downloaded and checked when it is new: not listed with
+the same address, hash, size, key and network targets in the catalog published last (whose
+signature is checked with the catalog key first). Versions it lists keep their recorded SHA-256
+and size and are not downloaded again, and revoked versions are never downloaded. The trade-off:
+a release asset that is deleted or replaced after its version was published no longer stops
+every publish (and so cannot let the catalog expire), but the registry does not notice it either.
+That stays safe, because Kalzit checks the SHA-256 and the signature of every package it downloads
+from the catalog and refuses one that differs; such a version simply fails to install until it is
+revoked. A version that is changed in the registry is checked again.
 
 To check locally before you open the pull request (needs Rust):
 
 ```sh
 cargo build --release --manifest-path tools/registry/Cargo.toml
-tools/registry/target/release/kalzit-registry fetch-list
+tools/registry/target/release/kalzit-registry fetch-list   # without --previous: every version that is not revoked
 # download each listed package into packages/<sha256>, then:
 tools/registry/target/release/kalzit-registry check --packages packages
 ```
@@ -135,3 +153,25 @@ environment of this repository. Only the owner creates and handles it.
    `https://mousewerk.github.io/kalzit-plugins/catalog.json` as the address, switch it on and load
    it. Kalzit's own plugins (`dev.kalzit.*`) are signed with Kalzit's compiled plugin key; a
    community plugin installs once its publisher key from `publishers/` is trusted the same way.
+
+Once `keys/catalog.pub` exists, CI refuses a pull request that changes or removes it, with one
+exception, a rotation (after a suspected leak, or on schedule):
+
+1. Create the new key as above and store it as `KALZIT_CATALOG_SIGNING_KEY` (this replaces the
+   old secret; publishing pauses until step 2 is merged).
+2. In one pull request, replace `keys/catalog.pub` with the new public key and append to
+   `keys/rotations.toml`:
+
+   ```toml
+   [[rotation]]
+   from = "<old public key, base64>"
+   to = "<new public key, base64>"
+   date = "2026-11-01"
+   reason = "Scheduled rotation."
+   ```
+
+   CI accepts the change only with exactly this new entry and marks it for the owner. Recorded
+   rotations are never changed or removed.
+3. Every Kalzit that reads the catalog has pinned the old key for its address: administrators add
+   and allow the new key, then confirm the key change when Kalzit refreshes the catalog. After a
+   leak, also take back the old key there.

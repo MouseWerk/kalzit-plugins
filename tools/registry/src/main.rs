@@ -1,36 +1,42 @@
 //! `kalzit-registry`, the checks and the catalog build of the plugin registry.
 //!
 //! ```text
-//! kalzit-registry fetch-list [--root .] [--base <dir>] [--all]
-//! kalzit-registry check [--root .] [--base <dir>] [--packages <dir>] [--all]
-//! kalzit-registry build [--root .] --packages <dir> --out <dir> --site-url <https url> [--now <unix secs>]
+//! kalzit-registry fetch-list [--root .] [--previous <dir>]
+//! kalzit-registry check [--root .] [--base <dir>] [--previous <dir>] [--packages <dir>]
+//! kalzit-registry build [--root .] --packages <dir> --out <dir> --site-url <https url> [--previous <dir>] [--now <unix secs>]
 //! kalzit-registry verify-catalog --index <file> --signature <file> --public-key-file <file> [--now <unix secs>]
 //! ```
 //!
-//! `fetch-list` prints `<sha256> <size> <url>` per package to download: the versions that are new
-//! against `--base` (a checkout of main), or all with `--all` or without a base. `check` checks the
-//! registry files, the rules against the base, and every package of those versions, read from
-//! `<packages>/<sha256>`. `build` checks everything and writes the catalog index, the store data,
-//! the screenshots and the publisher keys into `--out`. `verify-catalog` checks a signed index the
-//! way Kalzit does before the site is published.
+//! Packages are checked once: a version is downloaded and checked when it is neither revoked nor
+//! listed unchanged in the last published catalog. `--previous` is a directory with that catalog
+//! as published (`catalog.json`, `catalog.json.sig`, `store.json`; missing files mean nothing was
+//! published yet); it counts only when its signature verifies with the catalog key. Versions it
+//! lists keep their recorded SHA-256 and size without a new download, so a release asset that
+//! later disappears does not stop publishing (CONTRIBUTING.md, "What CI checks").
+//!
+//! `fetch-list` prints `<sha256> <size> <url>` per package to download. `check` checks the
+//! registry files, the rules against `--base` (a checkout of main), and the downloaded packages
+//! (`<packages>/<sha256>`). `build` checks everything and writes the catalog index, the store
+//! data, the screenshots and the publisher keys into `--out`. `verify-catalog` checks a signed
+//! index the way Kalzit does before the site is published.
 
 mod package;
 mod registry;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use ed25519_dalek::Signature;
-use kalzit_plugin_api::catalog::{self, Accepted, CatalogEntry, CatalogIndex, Revocation};
+use ed25519_dalek::{Signature, VerifyingKey};
+use kalzit_plugin_api::catalog::{self, Accepted, CatalogEntry, CatalogIndex};
 use kalzit_plugin_api::signing;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::registry::{CATEGORIES, Problems, Registry};
+use crate::registry::{CATEGORIES, Problems, Registry, VersionEntry, revocations_of};
 
 /// How long a published index stays valid. Kalzit takes at most 31 days; the publish workflow
 /// runs at least twice a month, so a missed run leaves time.
@@ -51,23 +57,19 @@ fn main() -> ExitCode {
 
 struct Options {
     pairs: Vec<(String, String)>,
-    flags: BTreeSet<String>,
 }
 
 impl Options {
-    fn parse(args: &[String], values: &[&str], flags: &[&str]) -> Result<Options, String> {
-        let mut o = Options { pairs: Vec::new(), flags: BTreeSet::new() };
+    fn parse(args: &[String], values: &[&str]) -> Result<Options, String> {
+        let mut o = Options { pairs: Vec::new() };
         let mut it = args.iter();
         while let Some(arg) = it.next() {
             let name = arg.strip_prefix("--").ok_or_else(|| format!("unexpected argument {arg}"))?;
-            if flags.contains(&name) {
-                o.flags.insert(name.to_string());
-            } else if values.contains(&name) {
-                let value = it.next().ok_or_else(|| format!("--{name} needs a value"))?;
-                o.pairs.push((name.to_string(), value.clone()));
-            } else {
+            if !values.contains(&name) {
                 return Err(format!("unknown option --{name}"));
             }
+            let value = it.next().ok_or_else(|| format!("--{name} needs a value"))?;
+            o.pairs.push((name.to_string(), value.clone()));
         }
         Ok(o)
     }
@@ -93,17 +95,24 @@ fn run(args: &[String]) -> Result<(), String> {
     let (command, rest) = args.split_first().ok_or(usage)?;
     match command.as_str() {
         "fetch-list" => {
-            let o = Options::parse(rest, &["root", "base"], &["all"])?;
-            let (registry, versions) = load_checked(&o)?;
-            for (id, version) in versions {
+            let o = Options::parse(rest, &["root", "previous", "now"])?;
+            let registry = load(&o)?;
+            let previous = Previous::load(o.get("previous"), &registry);
+            for (id, version) in to_download(&registry, &previous) {
                 let (_, v) = registry.version(&id, &version).expect("listed");
                 println!("{} {} {}", v.sha256, v.size, v.url);
             }
             Ok(())
         }
         "check" => {
-            let o = Options::parse(rest, &["root", "base", "packages"], &["all"])?;
-            let (registry, versions) = load_checked(&o)?;
+            let o = Options::parse(rest, &["root", "base", "previous", "packages", "now"])?;
+            let registry = load(&o)?;
+            if let Some(base) = o.get("base") {
+                compare(&registry, Path::new(base))?;
+            }
+            let previous = Previous::load(o.get("previous"), &registry);
+            let versions = to_download(&registry, &previous);
+            report_skipped(&registry, &versions);
             match o.get("packages") {
                 Some(dir) => {
                     verify_packages(&registry, &versions, Path::new(dir))?;
@@ -112,16 +121,15 @@ fn run(args: &[String]) -> Result<(), String> {
                 None => println!("registry files valid; packages not checked (pass --packages)"),
             }
             // The index built from these files must be one Kalzit takes.
-            let now = o.now()?;
-            index_bytes(&registry, now)?;
+            index_bytes(&registry, o.now()?)?;
             Ok(())
         }
         "build" => {
-            let o = Options::parse(rest, &["root", "packages", "out", "site-url", "now"], &[])?;
+            let o = Options::parse(rest, &["root", "packages", "out", "site-url", "previous", "now"])?;
             build(&o)
         }
         "verify-catalog" => {
-            let o = Options::parse(rest, &["index", "signature", "public-key-file", "now"], &[])?;
+            let o = Options::parse(rest, &["index", "signature", "public-key-file", "now"])?;
             verify_catalog(&o)
         }
         other => Err(format!("unknown command {other}; {usage}")),
@@ -140,35 +148,173 @@ fn fail(problems: Problems) -> String {
     text
 }
 
-/// Loads the registry, compares it with the base if given, and answers the versions whose
-/// packages are to be checked.
-fn load_checked(o: &Options) -> Result<(Registry, BTreeSet<(String, String)>), String> {
-    let now = o.now()?;
+fn load(o: &Options) -> Result<Registry, String> {
     let mut problems = Problems::default();
-    let registry = Registry::load(&o.root(), today(now), &mut problems);
-    let mut versions = registry.all_versions();
-    if let Some(base) = o.get("base") {
-        // The base was valid when it was merged; its own problems (a date, a rule added later) are
-        // not this change's.
-        let base = Registry::load(Path::new(base), i64::MAX / 2, &mut Problems::default());
-        let new = registry.compare_with_base(&base, &mut problems);
-        if !o.flags.contains("all") {
-            versions = new;
-        }
+    let registry = Registry::load(&o.root(), today(o.now()?), &mut problems);
+    if !problems.is_empty() {
+        return Err(fail(problems));
+    }
+    Ok(registry)
+}
+
+/// The rules against the base; changes that need the owner's eye are annotated in the CI run.
+fn compare(registry: &Registry, base: &Path) -> Result<(), String> {
+    // The base was valid when it was merged; its own problems (a date, a rule added later) are
+    // not this change's.
+    let base = Registry::load(base, i64::MAX / 2, &mut Problems::default());
+    let mut problems = Problems::default();
+    let mut attention = Vec::new();
+    registry.compare_with_base(&base, &mut problems, &mut attention);
+    let mut summary = String::new();
+    for a in &attention {
+        println!("::warning title=Needs the owner's attention::{a}");
+        summary.push_str(&format!("- {a}\n"));
+    }
+    if !summary.is_empty()
+        && let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY")
+    {
+        let text = format!("### Needs the owner's attention\n\n{summary}\n");
+        let _ = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
     }
     if !problems.is_empty() {
         return Err(fail(problems));
     }
-    Ok((registry, versions))
+    Ok(())
+}
+
+/// The catalog entry of one version, as the index lists it.
+fn entry_for(registry: &Registry, id: &str, v: &VersionEntry) -> CatalogEntry {
+    let f = &registry.plugins[id].file;
+    CatalogEntry {
+        id: id.to_string(),
+        version: v.version.clone(),
+        kind: f.kind.clone(),
+        name: f.name.clone(),
+        key_id: v.key_id.clone(),
+        url: v.url.clone(),
+        sha256: v.sha256.clone(),
+        size: v.size,
+        description: Some(f.description.en.clone()),
+        publisher: Some(f.author.clone()),
+        network: v.network.clone(),
+    }
+}
+
+/// What the store shows of a package beyond its entry.
+#[derive(Clone)]
+struct Extra {
+    min_kalzit: Option<String>,
+    platforms: Vec<String>,
+}
+
+/// The last published catalog, once its signature verified. Its messages go to stderr, so
+/// `fetch-list` prints nothing but packages on stdout.
+#[derive(Default)]
+struct Previous {
+    entries: BTreeMap<(String, String), CatalogEntry>,
+    /// Per package SHA-256, what the published store data said of it (display only).
+    extras: BTreeMap<String, Extra>,
+}
+
+impl Previous {
+    fn load(dir: Option<&str>, registry: &Registry) -> Previous {
+        let Some(dir) = dir.map(Path::new) else { return Previous::default() };
+        let (Ok(index), Ok(sig)) =
+            (std::fs::read(dir.join("catalog.json")), std::fs::read(dir.join("catalog.json.sig")))
+        else {
+            eprintln!("no published catalog: every version that is not revoked is checked");
+            return Previous::default();
+        };
+        let Some(key) = registry.previous_catalog_keys().iter().find_map(|k| {
+            let key = kalzit_plugin_tool::public_key(k).ok()?;
+            verify_signature(&index, &sig, &key).ok().map(|_| key)
+        }) else {
+            eprintln!(
+                "::warning::the published catalog does not verify with the catalog key: every version is checked"
+            );
+            return Previous::default();
+        };
+        // An expired index is still a signed record of what was checked; only its form counts here.
+        let Ok(parsed) = serde_json::from_slice::<CatalogIndex>(&index) else {
+            eprintln!("::warning::the published catalog cannot be read: every version is checked");
+            return Previous::default();
+        };
+        eprintln!(
+            "published catalog: sequence {}, {} entries, signed with key {}",
+            parsed.sequence,
+            parsed.plugins.len(),
+            signing::key_id(&key)
+        );
+        let entries = parsed.plugins.into_iter().map(|e| ((e.id.clone(), e.version.clone()), e)).collect();
+        let mut extras = BTreeMap::new();
+        if let Ok(store) = std::fs::read(dir.join("store.json"))
+            .map_err(|e| e.to_string())
+            .and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|e| e.to_string()))
+        {
+            for v in store["plugins"].as_array().into_iter().flatten().flat_map(|p| p["versions"].as_array()).flatten()
+            {
+                if let Some(sha) = v["sha256"].as_str() {
+                    let platforms =
+                        v["platforms"].as_array().into_iter().flatten().filter_map(|p| p.as_str().map(String::from));
+                    extras.insert(
+                        sha.to_string(),
+                        Extra { min_kalzit: v["minKalzit"].as_str().map(String::from), platforms: platforms.collect() },
+                    );
+                }
+            }
+        }
+        Previous { entries, extras }
+    }
+
+    /// Whether the published catalog lists this version with the same package: address, hash,
+    /// size, key, kind and network targets. Texts may change without a new check.
+    fn carries(&self, entry: &CatalogEntry) -> bool {
+        self.entries.get(&(entry.id.clone(), entry.version.clone())).is_some_and(|p| {
+            p.url == entry.url
+                && p.sha256 == entry.sha256
+                && p.size == entry.size
+                && p.key_id == entry.key_id
+                && p.kind == entry.kind
+                && p.network == entry.network
+        })
+    }
+}
+
+/// The versions to download and check: neither revoked nor carried over from the published
+/// catalog.
+fn to_download(registry: &Registry, previous: &Previous) -> BTreeSet<(String, String)> {
+    registry
+        .all_versions()
+        .into_iter()
+        .filter(|(id, version)| {
+            let (_, v) = registry.version(id, version).expect("listed");
+            !registry.revoked(id, version) && !previous.carries(&entry_for(registry, id, v))
+        })
+        .collect()
+}
+
+fn report_skipped(registry: &Registry, checked: &BTreeSet<(String, String)>) {
+    for (id, version) in registry.all_versions().difference(checked) {
+        let why = if registry.revoked(id, version) {
+            "revoked, not downloaded"
+        } else {
+            "unchanged in the published catalog, not downloaded again"
+        };
+        println!("skip {id} {version}: {why}");
+    }
 }
 
 fn verify_packages(
     registry: &Registry,
     versions: &BTreeSet<(String, String)>,
     dir: &Path,
-) -> Result<Vec<(String, String, package::Verified)>, String> {
+) -> Result<BTreeMap<String, Extra>, String> {
     let mut problems = Problems::default();
-    let mut out = Vec::new();
+    let mut out = BTreeMap::new();
     for (id, version) in versions {
         let (plugin, v) = registry.version(id, version).expect("listed");
         let publisher = &registry.publishers[&plugin.file.publisher];
@@ -179,7 +325,10 @@ fn verify_packages(
         match result {
             Ok(verified) => {
                 println!("ok {id} {version}");
-                out.push((id.clone(), version.clone(), verified));
+                out.insert(
+                    v.sha256.clone(),
+                    Extra { min_kalzit: Some(verified.min_kalzit), platforms: verified.platforms },
+                );
             }
             Err(e) => problems.add(format!("plugins/{id} version {version}: {e}")),
         }
@@ -194,35 +343,17 @@ fn verify_packages(
 fn index_bytes(registry: &Registry, now: u64) -> Result<(CatalogIndex, Vec<u8>), String> {
     let mut plugins = Vec::new();
     for (id, plugin) in &registry.plugins {
-        let f = &plugin.file;
-        for v in &f.versions {
-            plugins.push(CatalogEntry {
-                id: id.clone(),
-                version: v.version.clone(),
-                kind: f.kind.clone(),
-                name: f.name.clone(),
-                key_id: v.key_id.clone(),
-                url: v.url.clone(),
-                sha256: v.sha256.clone(),
-                size: v.size,
-                description: Some(f.description.en.clone()),
-                publisher: Some(f.author.clone()),
-                network: f.permissions.network.clone(),
-            });
+        for v in &plugin.file.versions {
+            plugins.push(entry_for(registry, id, v));
         }
     }
-    let revoked = registry
-        .revocations
-        .iter()
-        .map(|r| Revocation { id: r.id.clone(), versions: r.versions.clone(), reason: r.reason.clone() })
-        .collect();
     let index = CatalogIndex {
         format: catalog::CATALOG_FORMAT,
         sequence: now,
         published_at: now,
         expires_at: now + VALIDITY_SECS,
         plugins,
-        revoked,
+        revoked: revocations_of(&registry.revocations),
     };
     let bytes = serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?;
     // Any key will do: the signature is checked separately (`verify-catalog`).
@@ -249,22 +380,23 @@ fn build(o: &Options) -> Result<(), String> {
     if out.exists() {
         return Err(format!("{} exists already; build into a new directory", out.display()));
     }
-    let mut problems = Problems::default();
-    let registry = Registry::load(&o.root(), today(now), &mut problems);
-    if !problems.is_empty() {
-        return Err(fail(problems));
+    let registry = load(o)?;
+    let previous = Previous::load(o.get("previous"), &registry);
+    let versions = to_download(&registry, &previous);
+    report_skipped(&registry, &versions);
+    let mut extras = verify_packages(&registry, &versions, Path::new(o.required("packages")?))?;
+    for (sha, extra) in &previous.extras {
+        extras.entry(sha.clone()).or_insert_with(|| extra.clone());
     }
-    let verified = verify_packages(&registry, &registry.all_versions(), Path::new(o.required("packages")?))?;
     let (index, bytes) = index_bytes(&registry, now)?;
     write(&out.join("catalog.json"), &bytes)?;
 
-    // The catalog key, once the owner has added its public half (CONTRIBUTING.md, "Catalog key").
-    let catalog_key = match std::fs::read_to_string(o.root().join("keys/catalog.pub")) {
-        Ok(text) => {
-            let key = kalzit_plugin_tool::public_key(text.trim()).map_err(|e| format!("keys/catalog.pub: {e}"))?;
-            Some((text.trim().to_string(), signing::key_id(&key)))
+    let catalog_key = match &registry.catalog_key {
+        Some(text) => {
+            let key: VerifyingKey = kalzit_plugin_tool::public_key(text)?;
+            Some((text.clone(), signing::key_id(&key)))
         }
-        Err(_) => None,
+        None => None,
     };
 
     let mut publishers = Vec::new();
@@ -272,7 +404,7 @@ fn build(o: &Options) -> Result<(), String> {
         write(&out.join(format!("publishers/{name}.pub")), format!("{}\n", p.text).as_bytes())?;
         publishers.push(json!({
             "name": name, "publicKey": p.text, "keyId": signing::key_id(&p.key),
-            "url": format!("{site}/publishers/{name}.pub"),
+            "url": format!("{site}/publishers/{name}.pub"), "authors": p.authors,
         }));
     }
 
@@ -284,9 +416,10 @@ fn build(o: &Options) -> Result<(), String> {
             let source = plugin.dir.join(&s.file);
             let image = std::fs::read(&source).map_err(|e| format!("{}: {e}", source.display()))?;
             let size = imagesize::blob_size(&image).map_err(|e| format!("{}: {e}", source.display()))?;
-            write(&out.join(format!("screenshots/{id}/{}", s.file.trim_start_matches("screenshots/"))), &image)?;
+            let name = s.file.trim_start_matches("screenshots/");
+            write(&out.join(format!("screenshots/{id}/{name}")), &image)?;
             shots.push(json!({
-                "url": format!("{site}/screenshots/{id}/{}", s.file.trim_start_matches("screenshots/")),
+                "url": format!("{site}/screenshots/{id}/{name}"),
                 "alt": { "en": s.alt.en, "de": s.alt.de }, "width": size.width, "height": size.height,
             }));
         }
@@ -296,17 +429,18 @@ fn build(o: &Options) -> Result<(), String> {
             .iter()
             .rev()
             .map(|v| {
-                let extra = verified.iter().find(|(i, ver, _)| i == id && *ver == v.version).map(|(_, _, x)| x);
+                let extra = extras.get(&v.sha256);
                 json!({
                     "version": v.version, "released": v.released, "url": v.url, "sha256": v.sha256,
-                    "size": v.size, "keyId": v.key_id,
-                    "minKalzit": extra.map(|x| x.min_kalzit.clone()),
+                    "size": v.size, "keyId": v.key_id, "network": v.network,
+                    "minKalzit": extra.and_then(|x| x.min_kalzit.clone()),
                     "platforms": extra.map(|x| x.platforms.clone()).unwrap_or_default(),
                     "revoked": revocation_of(&v.version),
                 })
             })
             .collect();
-        let latest = f.versions.iter().rev().find(|v| revocation_of(&v.version).is_none()).map(|v| v.version.clone());
+        let latest = f.versions.iter().rev().find(|v| revocation_of(&v.version).is_none());
+        let shown = latest.or(f.versions.last());
         let own_revocations: Vec<Value> = registry
             .revocations
             .iter()
@@ -319,8 +453,10 @@ fn build(o: &Options) -> Result<(), String> {
             "author": f.author, "publisher": f.publisher,
             "keyId": signing::key_id(&registry.publishers[&f.publisher].key),
             "source": f.source, "license": f.license, "homepage": f.homepage,
-            "network": f.permissions.network, "screenshots": shots,
-            "latest": latest, "versions": versions, "revoked": own_revocations,
+            // The targets of the version the store offers (per version under `versions`).
+            "network": shown.map(|v| v.network.clone()).unwrap_or_default(),
+            "screenshots": shots,
+            "latest": latest.map(|v| v.version.clone()), "versions": versions, "revoked": own_revocations,
         }));
     }
 
@@ -362,34 +498,34 @@ fn landing(site: &str) -> String {
     )
 }
 
-fn verify_catalog(o: &Options) -> Result<(), String> {
-    let index = std::fs::read(o.required("index")?).map_err(|e| e.to_string())?;
-    let sig_bytes = std::fs::read(o.required("signature")?).map_err(|e| e.to_string())?;
-    let key_text = std::fs::read_to_string(o.required("public-key-file")?).map_err(|e| e.to_string())?;
-    let key = kalzit_plugin_tool::public_key(key_text.trim())?;
+/// Checks a detached catalog signature (`{ "keyId", "signature" }`) over `index` with `key`.
+fn verify_signature(index: &[u8], sig_bytes: &[u8], key: &VerifyingKey) -> Result<String, String> {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct Detached {
         key_id: String,
         signature: String,
     }
-    let sig: Detached = serde_json::from_slice(&sig_bytes).map_err(|e| format!("the signature file: {e}"))?;
-    if sig.key_id != signing::key_id(&key) {
-        return Err(format!("signed with key {}, expected {}", sig.key_id, signing::key_id(&key)));
+    let sig: Detached = serde_json::from_slice(sig_bytes).map_err(|e| format!("the signature file: {e}"))?;
+    if sig.key_id != signing::key_id(key) {
+        return Err(format!("signed with key {}, expected {}", sig.key_id, signing::key_id(key)));
     }
     let raw = BASE64.decode(sig.signature.trim()).map_err(|_| "the signature is not base64")?;
     let signature = Signature::from_slice(&raw).map_err(|_| "the signature is not 64 bytes")?;
-    if !signing::verify_catalog(&key, &index, &signature) {
+    if !signing::verify_catalog(key, index, &signature) {
         return Err("the catalog signature does not verify".into());
     }
-    let now = o.now()?;
-    let parsed = catalog::parse_index(&index, &key, &Accepted::default(), now)
+    Ok(sig.key_id)
+}
+
+fn verify_catalog(o: &Options) -> Result<(), String> {
+    let index = std::fs::read(o.required("index")?).map_err(|e| e.to_string())?;
+    let sig_bytes = std::fs::read(o.required("signature")?).map_err(|e| e.to_string())?;
+    let key_text = std::fs::read_to_string(o.required("public-key-file")?).map_err(|e| e.to_string())?;
+    let key = kalzit_plugin_tool::public_key(key_text.trim())?;
+    let key_id = verify_signature(&index, &sig_bytes, &key)?;
+    let parsed = catalog::parse_index(&index, &key, &Accepted::default(), o.now()?)
         .map_err(|e| format!("Kalzit would refuse the index: {e} ({})", e.code()))?;
-    println!(
-        "catalog valid: sequence {}, {} entries, signed with key {}",
-        parsed.sequence,
-        parsed.plugins.len(),
-        sig.key_id
-    );
+    println!("catalog valid: sequence {}, {} entries, signed with key {key_id}", parsed.sequence, parsed.plugins.len());
     Ok(())
 }

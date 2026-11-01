@@ -57,10 +57,10 @@ pub fn verify(
     // The permissions Kalzit's sandbox enforces are the manifest's network targets: the entry must
     // name exactly those (Kalzit refuses a catalog package whose targets differ), and fixed hosts
     // must pass Kalzit's default target rules.
-    if !same_network(&f.permissions.network, m) {
+    if !same_network(&version.network, m) {
         let declared: Vec<String> = m.permissions.network.iter().map(target_words).collect();
         return Err(format!(
-            "permissions.network must list exactly the package's targets: [{}]",
+            "network must list exactly the package's targets: [{}]",
             declared.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", ")
         ));
     }

@@ -12,8 +12,6 @@ homepage = "https://github.com/MouseWerk/Kalzit/tree/main/examples/plugins/csv-h
 en = "Reads a CSV or JSON file from an HTTP or HTTPS URL as a frame."
 de = "Liest eine CSV- oder JSON-Datei von einer HTTP- oder HTTPS-Adresse als Tabelle."
 
-[permissions]
-network = ["*"]
 
 [[versions]]
 version = "0.1.0"
@@ -22,3 +20,4 @@ url = "https://github.com/MouseWerk/Kalzit/releases/download/v0.5.0/dev.kalzit.c
 sha256 = "8acb441b6af4532db397408a17a5bd5b8c9fc949d49774875bda91bba91001a2"
 size = 4496349
 key_id = "581c30a0d8384cfd"
+network = ["*"]
