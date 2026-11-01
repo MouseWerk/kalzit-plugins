@@ -238,14 +238,19 @@ fn non_public_v4(ip: Ipv4Addr) -> bool {
 }
 
 /// An IPv6 address that is not a public unicast address: loopback, unspecified, unique-local,
-/// link-local, multicast, and IPv4 behind it (IPv4-mapped, IPv4-compatible, NAT64 `64:ff9b::/96`
-/// and `64:ff9b:1::/48`), which is judged as that IPv4 address; local NAT64 is refused as a whole.
+/// link-local, site-local (`fec0::/10`), multicast, the tunnels 6to4 (`2002::/16`) and Teredo
+/// (`2001::/32`), local NAT64 (`64:ff9b:1::/48`), and IPv4 behind it (IPv4-mapped,
+/// IPv4-translated `::ffff:0:a.b.c.d`, IPv4-compatible, NAT64 `64:ff9b::/96`), which is judged as
+/// that IPv4 address.
 fn non_public_v6(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
     if let Some(v4) = ip.to_ipv4_mapped() {
         return non_public_v4(v4);
     }
     let embedded = Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
+    if s[..4] == [0; 4] && s[4] == 0xffff && s[5] == 0 {
+        return non_public_v4(embedded);
+    }
     if s[..6] == [0; 6] && !ip.is_loopback() && !ip.is_unspecified() {
         return non_public_v4(embedded);
     }
@@ -257,22 +262,76 @@ fn non_public_v6(ip: Ipv6Addr) -> bool {
         || ip.is_multicast()
         || (s[0] & 0xfe00) == 0xfc00
         || (s[0] & 0xffc0) == 0xfe80
+        || (s[0] & 0xffc0) == 0xfec0
+        || s[0] == 0x2002
+        || (s[0] == 0x2001 && s[1] == 0)
         || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
 }
 
-/// A host Kalzit's default target rules refuse: `localhost` and every address that is not a
-/// public unicast address. (Kalzit's own check lives in its server crate, which this tool does
-/// not depend on; this one covers at least the same ranges.)
+/// A host made only of numbers in the forms old resolvers read as IPv4 (`127.1`, `2130706433`,
+/// `0x7f.0.0.1`, `0177.0.0.1`): one to four dot-separated decimal or `0x` hex parts.
+fn numeric_host(host: &str) -> bool {
+    let parts: Vec<&str> = host.split('.').collect();
+    (1..=4).contains(&parts.len())
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && (p.bytes().all(|b| b.is_ascii_digit())
+                    || p.strip_prefix("0x").is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit())))
+        })
+}
+
+/// A host Kalzit's default target rules refuse: `localhost`, every address that is not a public
+/// unicast address, an address with a zone id, and any numeric host that is not a canonical
+/// IPv4 address. (Kalzit's own check lives in its server crate, which this tool does not depend
+/// on; this one covers at least the same ranges.)
 pub fn private_host(host: &str) -> bool {
     let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
-    if host == "localhost" || host.ends_with(".localhost") {
+    let host = host.strip_suffix('.').unwrap_or(&host);
+    if host.is_empty() || host == "localhost" || host.ends_with(".localhost") || host.contains('%') {
         return true;
     }
     match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => non_public_v4(ip),
+        Ok(IpAddr::V4(ip)) => non_public_v4(ip) || ip.to_string() != host,
         Ok(IpAddr::V6(ip)) => non_public_v6(ip),
-        Err(_) => false,
+        Err(_) => numeric_host(host),
     }
+}
+
+/// The path of an `https://` URL with percent-encoded unreserved characters decoded and other
+/// escapes in upper case, or `None` when it has a query, a fragment, a backslash, an encoded `/`
+/// or `\`, or a `.` or `..` segment (also encoded).
+pub fn normalized_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    if rest.contains(['?', '#', '\\']) {
+        return None;
+    }
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let mut out = String::new();
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = path.get(i + 1..i + 3)?;
+            let value = u8::from_str_radix(hex, 16).ok()?;
+            if value == b'/' || value == b'\\' {
+                return None;
+            }
+            if value.is_ascii_alphanumeric() || b"-._~".contains(&value) {
+                out.push(value as char);
+            } else {
+                out.push('%');
+                out.push_str(&hex.to_ascii_uppercase());
+            }
+            i += 3;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    if out.split('/').any(|seg| seg == "." || seg == "..") {
+        return None;
+    }
+    Some(format!("https://{host}/{out}"))
 }
 
 /// Days since 1970-01-01 of a civil date, or `None` for an invalid one.
@@ -330,6 +389,13 @@ impl Registry {
             catalog_key: None,
             rotations: Vec::new(),
         };
+        // The top-level directories are plain directories, never links to elsewhere.
+        for dir in ["plugins", "publishers", "keys"] {
+            if is_link(&root.join(dir)) {
+                problems.add(format!("{dir}/: links are not allowed"));
+                return registry;
+            }
+        }
         registry.load_publishers(problems);
         registry.load_plugins(today, problems);
         registry.load_revocations(problems);
@@ -399,6 +465,18 @@ impl Registry {
                 continue;
             };
             self.publishers.insert(name.clone(), Publisher { name, text, key, authors: file.authors });
+        }
+        // An author name belongs to one publisher, so a name cannot be shown under another key.
+        let mut owners: BTreeMap<String, &str> = BTreeMap::new();
+        for p in self.publishers.values() {
+            for author in &p.authors {
+                if let Some(other) = owners.insert(author.to_lowercase(), &p.name) {
+                    problems.add(format!(
+                        "publishers/{}.toml: author {author} is listed for publisher {other} already",
+                        p.name
+                    ));
+                }
+            }
         }
     }
 
@@ -560,10 +638,18 @@ impl Registry {
                 Some(_) => bad(format!("{label}: released lies in the future")),
                 None => bad(format!("{label}: released is a date like 2026-11-01")),
             }
-            if !https_url(&v.url) {
+            let normalized = normalized_url(&v.url);
+            if !https_url(&v.url) || !v.url.is_ascii() {
                 bad(format!("{label}: url must be an https:// address without user info"));
-            } else if !v.url.starts_with(&release_prefix) || v.url.len() == release_prefix.len() {
-                bad(format!("{label}: url must be a release asset of the source, starting with {release_prefix}"));
+            } else if normalized.is_none() {
+                bad(format!("{label}: url must have no query, fragment, . or .. segments or encoded slashes"));
+            } else if normalized.as_deref() != Some(v.url.as_str())
+                || !v.url.starts_with(&release_prefix)
+                || v.url.len() == release_prefix.len()
+            {
+                bad(format!(
+                    "{label}: url must be a release asset of the source, starting with {release_prefix}, written without needless percent escapes"
+                ));
             }
             if !lower_hex(&v.sha256, 64) {
                 bad(format!("{label}: sha256 is 64 lowercase hex digits"));
@@ -752,24 +838,31 @@ impl Registry {
         if base.rotations.len() > self.rotations.len() || base.rotations[..] != self.rotations[..base.rotations.len()] {
             problems.add("keys/rotations.toml: recorded rotations are never changed or removed");
         }
-        if let Some(old) = &base.catalog_key {
-            match &self.catalog_key {
-                None => problems.add("keys/catalog.pub: the catalog key is never removed"),
-                Some(new) if new != old => {
-                    let added = &self.rotations[base.rotations.len().min(self.rotations.len())..];
-                    if added.len() == 1 && added[0].from == *old && added[0].to == *new {
-                        attention.push(format!("keys/catalog.pub: the catalog key rotates to {new}"));
-                    } else {
-                        problems.add(
-                            "keys/catalog.pub: the catalog key changes only with one new entry in keys/rotations.toml \
-                             from the old to the new key (CONTRIBUTING.md, \"Catalog key\")",
-                        );
-                    }
+        // A rotation entry is added only together with the key change it records, and a key
+        // change only with exactly one entry for it.
+        let added = &self.rotations[base.rotations.len().min(self.rotations.len())..];
+        match (&base.catalog_key, &self.catalog_key) {
+            (Some(_), None) => problems.add("keys/catalog.pub: the catalog key is never removed"),
+            (Some(old), Some(new)) if new != old => {
+                if added.len() == 1 && added[0].from == *old && added[0].to == *new {
+                    attention.push(format!("keys/catalog.pub: the catalog key rotates to {new}"));
+                } else {
+                    problems.add(
+                        "keys/catalog.pub: the catalog key changes only with one new entry in keys/rotations.toml \
+                         from the old to the new key (CONTRIBUTING.md, \"Catalog key\")",
+                    );
                 }
-                Some(_) => {}
             }
-        } else if self.catalog_key.is_some() {
-            attention.push("keys/catalog.pub: the catalog key is added".into());
+            (base_key, new_key) => {
+                if !added.is_empty() {
+                    problems.add(
+                        "keys/rotations.toml: a rotation is recorded only in the change that replaces keys/catalog.pub",
+                    );
+                }
+                if base_key.is_none() && new_key.is_some() {
+                    attention.push("keys/catalog.pub: the catalog key is added".into());
+                }
+            }
         }
     }
 
@@ -791,14 +884,18 @@ impl Registry {
         revocations_of(&self.revocations).iter().any(|r| r.covers(id, version))
     }
 
-    /// The keys a previous catalog may be signed with: the current catalog key and the key of
-    /// the last rotation before it.
-    pub fn previous_catalog_keys(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self.catalog_key.iter().cloned().collect();
+    /// The keys a previous catalog may be signed with, each with the latest publication time
+    /// (Unix seconds) it is accepted for: the current catalog key without a limit, and the key of
+    /// the last rotation only for a catalog published before the end of the rotation's day. The
+    /// first catalog published after a rotation is signed with the new key, so from then on an
+    /// index signed with the old key is never taken as a record of checked packages.
+    pub fn previous_catalog_keys(&self) -> Vec<(String, u64)> {
+        let mut keys: Vec<(String, u64)> = self.catalog_key.iter().map(|k| (k.clone(), u64::MAX)).collect();
         if let Some(last) = self.rotations.last()
             && Some(&last.to) == self.catalog_key.as_ref()
+            && let Some(day) = days_from_civil(&last.date)
         {
-            keys.push(last.from.clone());
+            keys.push((last.from.clone(), u64::try_from((day + 1) * 86_400).unwrap_or(0)));
         }
         keys
     }
@@ -853,11 +950,54 @@ mod tests {
             "::ffff:10.0.0.1",
             "64:ff9b::a00:1",
             "64:ff9b:1::1",
+            "localhost.",
+            "127.1",
+            "2130706433",
+            "0x7f.0.0.1",
+            "0177.0.0.1",
+            "8.8.8.08",
+            "2002:c000:204::1",
+            "2001:0:4136:e378::1",
+            "::ffff:0:7f00:1",
+            "fec0::1",
+            "fe80::1%eth0",
+            "",
         ] {
             assert!(private_host(host), "{host}");
         }
-        for host in ["db.example.dev", "8.8.8.8", "2001:db8::1", "::ffff:8.8.8.8", "64:ff9b::808:808"] {
+        for host in [
+            "db.example.dev",
+            "db.example.dev.",
+            "8.8.8.8",
+            "2001:db8::1",
+            "::ffff:8.8.8.8",
+            "64:ff9b::808:808",
+            "cafe.de",
+        ] {
             assert!(!private_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn urls_are_compared_normalized() {
+        let base = "https://github.com/a/b/releases/download/v1/x.zip";
+        assert_eq!(normalized_url(base).as_deref(), Some(base));
+        assert_eq!(
+            normalized_url("https://github.com/a/b/releases/download/v1/%78.zip").as_deref(),
+            Some("https://github.com/a/b/releases/download/v1/x.zip")
+        );
+        for bad in [
+            "https://github.com/a/b/releases/download/../../c/d/x.zip",
+            "https://github.com/a/b/releases/download/./x.zip",
+            "https://github.com/a/b/releases/download/%2e%2e/%2E%2e/c/x.zip",
+            "https://github.com/a/b/releases/download/.%2e/x.zip",
+            "https://github.com/a/b/releases/download/v1%2f..%2fx.zip",
+            "https://github.com/a/b/releases/download/v1/x.zip?a=1",
+            "https://github.com/a/b/releases/download/v1/x.zip#x",
+            "https://github.com/a/b/releases/download/v1\\x.zip",
+            "https://github.com/a/b/releases/download/v1/x%zz",
+        ] {
+            assert_eq!(normalized_url(bad), None, "{bad}");
         }
     }
 

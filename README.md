@@ -28,6 +28,7 @@ appended.
 | `tools/registry` | `kalzit-registry`: the checks and the catalog build, with Kalzit's own plugin crates. |
 | `signer` | `kalzit-catalog-signer`: the only code built next to the catalog key. |
 | `.github/workflows/ci.yml` | Checks for every pull request, read-only and without secrets. |
+| `.github/workflows/review.yml` | Owner-attention flags for every pull request, from main's own workflow and tool. |
 | `.github/workflows/publish.yml` | Builds, signs and publishes the catalog from main to GitHub Pages. |
 
 ## What is published

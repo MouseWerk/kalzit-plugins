@@ -1,0 +1,84 @@
+name: Review
+
+# The owner-attention flags of a pull request, made by main's own tool and main's own workflow, so
+# a pull request cannot hide them by changing tools/ or this file: `pull_request_target` always
+# runs the workflow of the base branch. The pull request's files are only read as data by the
+# registry tool built from main; nothing of the pull request is built or run, the token can only
+# read, and no secret is used.
+#
+# - Every change under .github/, tools/, signer/, keys/, publishers/ or revocations.toml is
+#   flagged, unconditionally.
+# - main's tool compares the pull request with main and flags what needs the owner's eye
+#   (changed names, authors, sources, homepages, new publishers, key rotations). When the pull
+#   request changes the tool or the formats, main's tool may not read it: that is reported, and
+#   the unconditional flag above stands.
+#
+# There is a single maintainer, so code owner reviews are not required (nobody could approve the
+# owner's own pull requests); these flags in the run summary and the review the owner gives every
+# pull request before merging take their place (CONTRIBUTING.md).
+
+on:
+  pull_request_target:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  owner-attention:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # main, the base of the pull request: the tool that judges it comes from here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+      # The pull request's files, as data only.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          path: pr
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Paths that always need the owner
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git -C pr fetch --no-tags "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$BASE_SHA"
+          changed="$(git -C pr diff --name-only "$BASE_SHA" HEAD | grep -E '^(\.github/|tools/|signer/|keys/|publishers/|revocations\.toml$)' || true)"
+          if [ -n "$changed" ]; then
+            {
+              echo "### Needs the owner's attention"
+              echo
+              echo "This pull request changes the workflows, the tools, the signer, keys, publishers or revocations:"
+              echo
+              printf -- '- `%s`\n' $changed
+            } >> "$GITHUB_STEP_SUMMARY"
+            for path in $changed; do
+              echo "::warning title=Needs the owner's attention::$path changes"
+            done
+          fi
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10
+        with:
+          toolchain: stable
+      - name: Flags from main's tool
+        run: |
+          set -uo pipefail
+          if [ ! -f base/tools/registry/Cargo.toml ]; then
+            echo "::warning title=Needs the owner's attention::main has no registry tool yet; review every file"
+            exit 0
+          fi
+          cargo build --release --locked --manifest-path base/tools/registry/Cargo.toml
+          if ! base/tools/registry/target/release/kalzit-registry check --root pr --base base; then
+            echo "::warning title=Needs the owner's attention::main's registry tool does not accept this pull request (expected when it changes the tool or the formats; the CI run checks it with its own tool)"
+          fi

@@ -93,13 +93,29 @@ Compute the hash and size of the package file with `sha256sum` and `stat -c %s` 
   which Kalzit refuses. A panel bundle must be one Kalzit can serve.
 - Against main: published versions never change and new versions are higher than all published
   ones; a published key, publisher, kind or revocation never changes, and a published plugin is
-  not removed. Changes of the name, author, source or homepage of a published plugin, new
-  publishers and changed author lists are allowed but marked in the CI run for the owner.
+  not removed. A rotation entry in `keys/rotations.toml` comes only with the key change it
+  records. Every `url` has no query, fragment, `.` or `..` segment (also percent-encoded), and an
+  author name belongs to one publisher only.
 - The catalog built from the registry is one Kalzit takes. A preview of it is attached to the CI
   run as the artifact `catalog-preview` (unsigned).
 
+**Owner attention.** The Review workflow runs on every pull request from main's own workflow file
+(`pull_request_target`) and with main's own registry tool, built from main and reading the pull
+request's files as data only, so a pull request cannot hide its flags by changing `tools/` or
+`.github/`. It flags, in the run summary and as annotations:
+
+- every change under `.github/`, `tools/`, `signer/`, `keys/`, `publishers/` or
+  `revocations.toml`, unconditionally;
+- changes of the name, author, source or homepage of a published plugin, new publishers, changed
+  author lists and key rotations, as main's tool finds them; when the pull request changes the
+  tool or the formats so that main's tool cannot read it, that is flagged too.
+
+The registry has a single maintainer, so code owner reviews are not required (nobody could
+approve the owner's own pull requests). The unconditional flags and the owner's review of every
+pull request before merging take their place; CODEOWNERS still requests that review.
+
 Packages are checked once. A version is downloaded and checked when it is new: not listed with
-the same address, hash, size, key and network targets in the catalog published last (whose
+the same address, hash, size, key, name and network targets in the catalog published last (whose
 signature is checked with the catalog key first). Versions it lists keep their recorded SHA-256
 and size and are not downloaded again, and revoked versions are never downloaded. The trade-off:
 a release asset that is deleted or replaced after its version was published no longer stops
@@ -171,7 +187,10 @@ exception, a rotation (after a suspected leak, or on schedule):
    ```
 
    CI accepts the change only with exactly this new entry and marks it for the owner. Recorded
-   rotations are never changed or removed.
+   rotations are never changed or removed, and no entry is added without a key change. The old
+   key is still accepted for the published catalog (as the record of checked packages) only for an
+   index published before the end of the rotation's `date`; after that, an index signed with it
+   counts as no record, and every version is checked again.
 3. Every Kalzit that reads the catalog has pinned the old key for its address: administrators add
    and allow the new key, then confirm the key change when Kalzit refreshes the catalog. After a
    leak, also take back the old key there.

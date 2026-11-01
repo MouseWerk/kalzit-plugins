@@ -229,9 +229,9 @@ impl Previous {
             eprintln!("no published catalog: every version that is not revoked is checked");
             return Previous::default();
         };
-        let Some(key) = registry.previous_catalog_keys().iter().find_map(|k| {
-            let key = kalzit_plugin_tool::public_key(k).ok()?;
-            verify_signature(&index, &sig, &key).ok().map(|_| key)
+        let Some((key, not_after)) = registry.previous_catalog_keys().into_iter().find_map(|(k, not_after)| {
+            let key = kalzit_plugin_tool::public_key(&k).ok()?;
+            verify_signature(&index, &sig, &key).ok().map(|_| (key, not_after))
         }) else {
             eprintln!(
                 "::warning::the published catalog does not verify with the catalog key: every version is checked"
@@ -243,6 +243,13 @@ impl Previous {
             eprintln!("::warning::the published catalog cannot be read: every version is checked");
             return Previous::default();
         };
+        // The key before a rotation counts only for an index published before the rotation.
+        if parsed.published_at > not_after {
+            eprintln!(
+                "::warning::the published catalog is signed with the key before the rotation: every version is checked"
+            );
+            return Previous::default();
+        }
         eprintln!(
             "published catalog: sequence {}, {} entries, signed with key {}",
             parsed.sequence,
@@ -251,9 +258,12 @@ impl Previous {
         );
         let entries = parsed.plugins.into_iter().map(|e| ((e.id.clone(), e.version.clone()), e)).collect();
         let mut extras = BTreeMap::new();
+        // The store data counts only when it belongs to exactly this index.
+        let index_sha = hex::encode(Sha256::digest(&index));
         if let Ok(store) = std::fs::read(dir.join("store.json"))
             .map_err(|e| e.to_string())
             .and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|e| e.to_string()))
+            && store["catalog"]["sha256"].as_str() == Some(index_sha.as_str())
         {
             for v in store["plugins"].as_array().into_iter().flatten().flat_map(|p| p["versions"].as_array()).flatten()
             {
@@ -271,10 +281,12 @@ impl Previous {
     }
 
     /// Whether the published catalog lists this version with the same package: address, hash,
-    /// size, key, kind and network targets. Texts may change without a new check.
+    /// size, key, kind, name and network targets (the name is checked against the package's
+    /// manifest). Descriptions may change without a new check.
     fn carries(&self, entry: &CatalogEntry) -> bool {
         self.entries.get(&(entry.id.clone(), entry.version.clone())).is_some_and(|p| {
-            p.url == entry.url
+            p.name == entry.name
+                && p.url == entry.url
                 && p.sha256 == entry.sha256
                 && p.size == entry.size
                 && p.key_id == entry.key_id
